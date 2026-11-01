@@ -1,0 +1,19 @@
+# 依赖与虚拟环境
+.venv/
+**/.venv/
+.deps/
+__pycache__/
+*.pyc
+
+# 本机配置（真实路径）—— 每台机器不一样，不要提交
+config.local.json
+
+# 真实数据与凭证 —— 绝对不要提交
+data/
+*.db
+*.db-journal
+*.db-wal
+credentials.txt
+
+# 导出物
+exports/

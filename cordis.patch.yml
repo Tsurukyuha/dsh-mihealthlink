@@ -1,0 +1,20 @@
+# dsh-mihealthlink —— bundle patch
+#
+# 冷启动生效的是这一层（profile 里同 id 的行只在热重载时叠上去）。
+#
+# 路径都是 **WSL 内部路径**，而且是**占位符**：`~` / `$HOME` 不会展开
+# （参数直接交给 wsl.exe，没有 shell）。改法见 README「配置你自己的路径」：
+# 推荐在插件目录建 config.local.json（已被 .gitignore 排除），改它不用动本文件。
+- insert:
+    - id: mihealthlink
+      name: dsh-mihealthlink
+      config:
+        wslDistro: Ubuntu-24.04
+        pythonPath: /home/YOUR_USER/mi-fitness/.venv/bin/python
+        bridgePath: /home/YOUR_USER/mi-fitness/.venv/bin/mi-fitness-bridge
+        reportScript: /home/YOUR_USER/dsh-mihealthlink/tools/daily_report.py
+        dbPath: /home/YOUR_USER/dsh-mihealthlink/data/mi_fitness.db
+        autoSyncHours: 3
+        autoSyncDays: 2
+        syncTimeoutMs: 600000
+        logFile: 'E:\AI\state\mihealthlink.log'

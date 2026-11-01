@@ -1,0 +1,39 @@
+{
+  "name": "dsh-mihealthlink",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "把小米运动健康（Mi Fitness）接进 DSH：步数/睡眠/心率同步到本地 SQLite，并提供体检、同步、日报三个工具。",
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "author": "Tsurukyuha",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tsurukyuha/dsh-mihealthlink.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Tsurukyuha/dsh-mihealthlink/issues"
+  },
+  "homepage": "https://github.com/Tsurukyuha/dsh-mihealthlink#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "xiaomi",
+    "mi-fitness",
+    "health"
+  ]
+}
