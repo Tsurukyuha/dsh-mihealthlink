@@ -29,11 +29,19 @@ from daily_report import collect  # noqa: E402
 
 # ---------------------------------------------------------------- 阈值与文案 --
 
-def pick_issue(data: dict, days_steps: dict, sec_cfg: dict) -> dict | None:
-    """返回 {topic, facts, hint}；没有值得说的就返回 None。"""
+# 演示用的事实（只有 --demo 时才用，消息里会带【演示】标记，避免被当成真实数据）
+DEMO_FACTS = {
+    "short-sleep": ("昨晚只睡了 4 小时 52 分", "顺口提一句，别像闹钟。"),
+    "low-steps": ("连着两天没怎么动，今天到现在 312 步", "关心一句，别劝运动劝得太生硬。"),
+    "high-hr": ("最近一段静息心率偏高（98 bpm）", "关心一下状态，别下诊断。"),
+}
+
+def candidates(data: dict, days_steps: dict, sec_cfg: dict) -> list[dict]:
+    """所有够格的关心点，按优先级排序（短睡 > 久坐 > 心率）。"""
     sleep_min = sec_cfg.get("sleepMinHours", 6) * 60
     steps_min = sec_cfg.get("stepsMinPerDay", 500)
     h = datetime.now().hour
+    out: list[dict] = []
 
     s = data.get("last_sleep")
     if s and s.get("duration_minutes"):
@@ -41,30 +49,38 @@ def pick_issue(data: dict, days_steps: dict, sec_cfg: dict) -> dict | None:
         # 只对「今天凌晨醒来」的睡眠说，别把前天的翻出来
         if s.get("wake_date") == date.today().isoformat() and dur < sleep_min:
             hh, mm = divmod(int(dur), 60)
-            return {
+            out.append({
                 "topic": "short-sleep",
                 "facts": f"昨晚只睡了 {hh} 小时 {mm} 分",
                 "hint": "顺口提一句，别像闹钟，也别复述数据，语气自然些。",
-            }
+            })
 
     # 连续两天步数都很低
     low = [d for d, v in sorted(days_steps.items())[-2:] if v is not None and v < steps_min]
     if len(low) >= 2 and h >= 15:
         latest = sorted(days_steps.items())[-1][1]
-        return {
+        out.append({
             "topic": "low-steps",
             "facts": f"连着两天没怎么动，今天到现在 {latest} 步",
             "hint": "可以关心一句，别劝运动劝得太生硬。",
-        }
+        })
 
     hr = (data.get("heart_rate") or [])[:1]
     if hr and hr[0].get("avg") and hr[0]["avg"] >= sec_cfg.get("hrAlarm", 95):
-        return {
+        out.append({
             "topic": "high-hr",
             "facts": f"最近一段心率均值偏高（{hr[0]['avg']} bpm）",
             "hint": "关心一下状态，别下诊断。",
-        }
-    return None
+        })
+    return out
+
+
+def pick_issue(data: dict, days_steps: dict, sec_cfg: dict, only: str | None = None) -> dict | None:
+    """按优先级挑一个；only 指定话题时只返回那个（不够格就 None）。"""
+    found = candidates(data, days_steps, sec_cfg)
+    if only:
+        return next((c for c in found if c["topic"] == only), None)
+    return found[0] if found else None
 
 
 def build_message(issue: dict) -> str:
@@ -154,6 +170,8 @@ def main() -> int:
     # 插件用这两个：emit 只输出决定（JSON），record 在真正发出去之后记账
     ap.add_argument("--emit", action="store_true", help="输出 JSON 决定，不发送")
     ap.add_argument("--record-topic", help="记账：把某个话题标记为今天已发")
+    ap.add_argument("--topic", help="只针对某个话题（short-sleep / low-steps / high-hr）")
+    ap.add_argument("--demo", action="store_true", help="演示模式：用示例事实，消息里会标明【演示】")
     a = ap.parse_args()
 
     if a.record_topic:
@@ -174,7 +192,11 @@ def main() -> int:
     }
 
     data = collect(a.db, 3)
-    issue = pick_issue(data, days_steps(a.db), cfg)
+    if a.demo:
+        facts, hint = DEMO_FACTS.get(a.topic, ("示例数据", "随便说一句。"))
+        issue = {"topic": a.topic or "demo", "facts": "【演示】" + facts, "hint": hint}
+    else:
+        issue = pick_issue(data, days_steps(a.db), cfg, only=a.topic)
     if not issue:
         if a.emit:
             print(json.dumps({"action": "none"}, ensure_ascii=False))

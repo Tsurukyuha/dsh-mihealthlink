@@ -45,10 +45,13 @@ def collect(db: str, days: int) -> dict:
         out["today_activity"] = None
 
     # 最近一次主睡眠（非小睡）
+    # ⚠️ 同一次睡眠会被多次同步反复「更新」（同 start_at、时长递增），
+    #    只按 start_at 排序会随机取到早期的短版本（实测取到 305 分钟，
+    #    而真实的整觉是 614 分钟）——所以再按 duration 降序取最长的那条。
     row = q(cur, """select substr(start_at,1,10), substr(start_at,12,5), substr(end_at,12,5),
                            duration_minutes, time_asleep_minutes, sleep_score
                     from sleep_sessions where coalesce(is_nap,0)=0
-                    order by start_at desc limit 1""")
+                    order by start_at desc, duration_minutes desc limit 1""")
     if row:
         d, s, e, dur, asleep, score = row[0]
         out["last_sleep"] = {

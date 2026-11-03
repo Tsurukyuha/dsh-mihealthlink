@@ -33,7 +33,15 @@ export const DEFAULTS = {
   bridgePath: '/home/YOUR_USER/mi-fitness/.venv/bin/mi-fitness-bridge',
   reportScript: '/home/YOUR_USER/dsh-mihealthlink/tools/daily_report.py',
   dbPath: '/home/YOUR_USER/dsh-mihealthlink/data/mi_fitness.db',
-  /** 自动同步间隔（小时），0 = 关闭 */
+  /**
+   * 同步时刻表（本地时间，24 小时制）。
+   * 为什么不是固定间隔：手环的数据有「何时才产生」的规律 —— 睡眠要等起床后才有，
+   * 步数是一天里慢慢累积的。所以按用户的作息挑时刻，而不是每 N 小时一次。
+   * 默认 6 次/天：0 点 1 次、上午 3 次（6~12 点）、下午 2 次（13~20 点）。
+   * 列表为空时回落到下面的 autoSyncHours 固定间隔。
+   */
+  autoSyncTimes: ['00:15', '06:30', '09:30', '12:00', '15:00', '19:30'],
+  /** 自动同步间隔（小时）——仅在 autoSyncTimes 为空时生效 */
   autoSyncHours: 3,
   /**
    * 启动后先补一次同步（true = 开）。
@@ -552,7 +560,7 @@ export function apply(ctx, rawConfig = {}) {
   cfg.autoSyncHours = Number(cfg.autoSyncHours)
   if (!Number.isFinite(cfg.autoSyncHours)) cfg.autoSyncHours = DEFAULTS.autoSyncHours
 
-  log(cfg, '插件已加载（平台=' + process.platform + '，自动同步每 ' + (cfg.autoSyncHours || '关闭') + ' 小时）')
+  log(cfg, '插件已加载（平台=' + process.platform + '，同步方式见下方时刻表/间隔）')
 
   ctx.effect(() => ctx.tools.register(statusTool(cfg)), 'dsh-mihealthlink: status')
   ctx.effect(() => ctx.tools.register(syncTool(cfg)), 'dsh-mihealthlink: sync')
@@ -575,31 +583,91 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   const tick = makeAutoSync(cfg)
-  if (cfg.autoSyncHours > 0) {
+  const syncTimes = normalizeTimes(cfg.autoSyncTimes)
+  if (syncTimes.length > 0 || cfg.autoSyncHours > 0) {
     ctx.effect(() => {
       let timer = null
       let first = null
-      const everyMs = cfg.autoSyncHours * 3600 * 1000
-      const startInterval = () => {
-        timer = setInterval(() => {
-          void tick()
-        }, everyMs)
+      let stopped = false
+
+      /** 按时刻表排下一次；列表为空则回落到固定间隔 */
+      const scheduleNext = () => {
+        if (stopped) return
+        let delayMs
+        let label
+        if (syncTimes.length > 0) {
+          const next = nextOccurrence(syncTimes)
+          delayMs = next.delayMs
+          label = `${String(next.h).padStart(2, '0')}:${String(next.m).padStart(2, '0')}`
+        } else {
+          delayMs = cfg.autoSyncHours * 3600 * 1000
+          label = `${cfg.autoSyncHours} 小时后`
+        }
+        timer = setTimeout(async () => {
+          log(cfg, `按计划同步（${label}）`)
+          try {
+            await tick()
+          } finally {
+            scheduleNext()
+          }
+        }, delayMs)
         if (typeof timer.unref === 'function') timer.unref()
       }
+
       if (cfg.autoSyncOnStart) {
         const delay = Number(cfg.autoSyncInitialDelayMs)
         first = setTimeout(() => {
-          log(cfg, '启动补同步（距上次手动同步可能已经很久）')
-          void tick().finally(startInterval)
+          log(cfg, '启动补同步（距上次同步可能已经很久）')
+          void tick().finally(scheduleNext)
         }, Number.isFinite(delay) && delay >= 0 ? delay : DEFAULTS.autoSyncInitialDelayMs)
         if (typeof first.unref === 'function') first.unref()
       } else {
-        startInterval()
+        scheduleNext()
       }
+
       return () => {
+        stopped = true
         if (first) clearTimeout(first)
-        if (timer) clearInterval(timer)
+        if (timer) clearTimeout(timer)
       }
     }, 'dsh-mihealthlink: auto sync')
+    if (syncTimes.length > 0) {
+      log(cfg, '同步时刻表：' + syncTimes.map((t) => `${String(t.h).padStart(2, '0')}:${String(t.m).padStart(2, '0')}`).join(' / '))
+    }
   }
+}
+
+/** 把 "06:30" 这类字符串规整成 [{h,m}]，非法项丢掉 */
+function normalizeTimes(list) {
+  if (!Array.isArray(list)) return []
+  const out = []
+  for (const raw of list) {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(raw).trim())
+    if (!m) continue
+    const h = Number(m[1])
+    const mi = Number(m[2])
+    if (h < 0 || h > 23 || mi < 0 || mi > 59) continue
+    out.push({ h, m: mi })
+  }
+  return out.sort((a, b) => a.h * 60 + a.m - (b.h * 60 + b.m))
+}
+
+/** 找下一个触发时刻（本地时间） */
+function nextOccurrence(times) {
+  const now = new Date()
+  const nowMin = now.getHours() * 60 + now.getMinutes()
+  for (const t of times) {
+    const target = t.h * 60 + t.m
+    if (target > nowMin) {
+      const d = new Date(now)
+      d.setHours(t.h, t.m, 0, 0)
+      return { ...t, delayMs: Math.max(1000, d.getTime() - now.getTime()) }
+    }
+  }
+  // 今天都过了 → 明天第一条
+  const t = times[0]
+  const d = new Date(now)
+  d.setDate(d.getDate() + 1)
+  d.setHours(t.h, t.m, 0, 0)
+  return { ...t, delayMs: Math.max(1000, d.getTime() - now.getTime()) }
 }
