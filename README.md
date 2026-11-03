@@ -48,6 +48,7 @@ Windows 下四个路径必须是 **WSL 内部路径**（`/home/...`、`/mnt/c/..
 | `mi_health_sync(days)` | 同步最近 N 天到本地库（默认 7，幂等） | 「更新一下我的数据」 |
 | `mi_health_report(json?, days?)` | 完整日报：活动、睡眠、心率、趋势 | 「给我看看这周的情况」 |
 | `mi_health_brief(days?)` | **一句话总结**，省 token | 「我昨晚睡得怎么样」 |
+| `mi_health_nudge(dryRun?, force?)` | **主动关心**：按阈值检查后往 QQ 投一句提醒 | 「她会不会主动关心我」 |
 
 `mi_health_brief` 的输出长这样：
 
@@ -57,6 +58,61 @@ Windows 下四个路径必须是 **WSL 内部路径**（`/home/...`、`/mnt/c/..
 
 后台还会**每 3 小时自动同步一次**（`autoSyncHours`，设 0 关闭）。
 
+## 健康主动关心（可选）
+
+默认**关闭**。开启后插件每 30 分钟检查一次本地库，够格就通过 SurfCore 的控制台接口
+往指定 QQ 会话投一句「后台提醒」，让 AI 自己决定要不要开口、怎么开口。
+
+### 什么时候会提醒
+
+| 话题 | 触发条件 |
+|---|---|
+| `short-sleep` | 昨晚（今晨醒来）睡眠 < 6 小时 |
+| `low-steps` | 连续两天步数 < 500，且已过 15:00 |
+| `high-hr` | 最近一段心率均值 ≥ 95 bpm |
+
+### 三道闸（防止变成骚扰机器人）
+
+```
+每天最多 1 条          nudgeMaxPerDay
+只在 08:00~23:00 发    nudgeQuietStart / nudgeQuietEnd
+同一话题 3 天内不重复   nudgeDedupeDays
+```
+
+### 配置
+
+写在本机 `config.local.json`（**不要提交**）：
+
+```json
+{
+  "nudgeEnabled": true,
+  "nudgeKey": "private:你的QQ号",
+  "nudgeUrl": "http://127.0.0.1:3100/api/console/notify-ai",
+  "nudgeToken": "SurfCore 的 consoleToken",
+  "nudgeScript": "/home/你/dsh-mihealthlink/tools/health_watch.py",
+  "nudgeState": "/home/你/dsh-mihealthlink/data/health-watch.json"
+}
+```
+
+闸门状态（今天发了几条、哪些话题说过）存在 `nudgeState` 指向的 JSON 里。
+
+### 为什么投递在 Node 侧做
+
+SurfCore 的桥接只听 `127.0.0.1:3100`，而 WSL 里的 `127.0.0.1` 是 WSL 自己，
+**从 WSL 里请求会 Connection refused**。所以拆成三步：
+
+```
+WSL python  → 判断该不该发、发什么（--emit 输出 JSON）
+Node 侧     → fetch 投递（Windows 上 127.0.0.1 才是对的）
+WSL python  → --record-topic 记账
+```
+
+### 手动试
+
+```
+mi_health_nudge                 # 预演：只显示会说什么，不发
+mi_health_nudge force=true      # 立刻真发一条（绕过时段和去重）
+```
 ## 安装
 
 ### 1. Python 依赖

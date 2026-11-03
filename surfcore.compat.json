@@ -1,0 +1,33 @@
+{
+  "$comment": "SurfCore 的插件兼容性体检会读这个文件，判断本插件注册的工具在 QQ 会话里会不会被 qq-tool-restrict 拒绝。新增工具时请一起更新这里，否则体检只能把它标成 unknown。",
+  "name": "dsh-mihealthlink",
+  "capabilities": ["local-read", "network-read", "local-state"],
+  "tools": [
+    {
+      "name": "mi_health_status",
+      "access": "read",
+      "note": "调 WSL 里的 mi-fitness-bridge doctor，会探一次小米云端连通性；不写库"
+    },
+    {
+      "name": "mi_health_report",
+      "access": "read",
+      "note": "只读本地 SQLite 出日报，不联网"
+    },
+    {
+      "name": "mi_health_brief",
+      "access": "read",
+      "note": "只读本地 SQLite 出一句话摘要，不联网"
+    },
+    {
+      "name": "mi_health_sync",
+      "access": "write",
+      "note": "打小米云端并写库；插件侧有 4 小时最小间隔（minSyncIntervalMs），避免撞限流"
+    },
+    {
+      "name": "mi_health_nudge",
+      "access": "write",
+      "note": "会往 QQ 会话投一条后台提醒（经 SurfCore /api/console/notify-ai）。默认 dryRun=true 只预演；force=true 才真的发，且仍受每日条数/时段/话题去重三道闸限制"
+    }
+  ],
+  "qqSessionNote": "QQ 会话里五个工具都放行；mi_health_sync 的限流保护在插件内部（4 小时冷却），mi_health_nudge 默认预演、真发受三道闸约束，都不靠白名单挡。"
+}

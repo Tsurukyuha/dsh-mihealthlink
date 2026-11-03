@@ -14,7 +14,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 export const name = 'dsh-mihealthlink'
@@ -35,12 +35,60 @@ export const DEFAULTS = {
   dbPath: '/home/YOUR_USER/dsh-mihealthlink/data/mi_fitness.db',
   /** 自动同步间隔（小时），0 = 关闭 */
   autoSyncHours: 3,
+  /**
+   * 启动后先补一次同步（true = 开）。
+   * 为什么必须有：定时器是「进程启动后 N 小时」才会第一次触发，而 DSH 的
+   * 重启频率远高于 3 小时 —— 只有 setInterval 的话，自动同步可能永远不执行，
+   * 库里的数据会一直停在最后一次手动同步。这里启动后先跑一次，之后才按间隔走。
+   */
+  autoSyncOnStart: true,
+  /** 启动后多久跑第一次（毫秒）；留一点余量，避免和 DSH 启动阶段抢资源 */
+  autoSyncInitialDelayMs: 120000,
   /** 自动同步拉多少天 */
   autoSyncDays: 2,
   /** 单次同步超时 */
   syncTimeoutMs: 600000,
   /** 事件日志（相对路径则落在当前工作目录） */
   logFile: 'mihealthlink.log',
+
+  /* ------------------------------------------------------------ 主动关心 -- */
+  /**
+   * 健康主动关心：定时读本地库，够格就把一句话投给她的 QQ。
+   * 默认关闭 —— 需要本机在 config.local.json 里打开并填 nudgeToken。
+   */
+  nudgeEnabled: false,
+  /** 判断脚本（占位符，同上面的路径规则） */
+  nudgeScript: '/home/YOUR_USER/dsh-mihealthlink/tools/health_watch.py',
+  /** 闸门状态文件（记录今天发了几条、哪些话题说过） */
+  nudgeState: 'health-watch.json',
+  /** SurfCore 的后台提醒接口 */
+  nudgeUrl: 'http://127.0.0.1:3100/api/console/notify-ai',
+  /** 投给谁（group:群号 或 private:QQ号） */
+  nudgeKey: 'private:201236582',
+  /** 控制台令牌，放 config.local.json，不要提交 */
+  nudgeToken: '',
+  /** 检查间隔（分钟） */
+  nudgeIntervalMinutes: 30,
+  /** 睡眠少于这个小时数就提 */
+  sleepMinHours: 6,
+  /** 单日步数低于这个值算「没怎么动」 */
+  stepsMinPerDay: 500,
+  /** 每天最多发几条 */
+  nudgeMaxPerDay: 1,
+  /** 同一话题多少天内不重复 */
+  nudgeDedupeDays: 3,
+  /** 允许发送的时段（小时，左闭右开） */
+  nudgeQuietStart: 8,
+  nudgeQuietEnd: 23,
+  /**
+   * 手动/工具触发的同步最小间隔（毫秒）。默认 4 小时（2026-11-01 用户定）。
+   * 为什么要有：mi_health_sync 是唯一真的会打小米云端的工具，放行给 QQ 会话后
+   * 她可能连着问几次；小米那边会限流，撞上之后一整天都同步不了。
+   * 自动同步不受这道闸限制（它自己就是 3 小时一次）。
+   */
+  minSyncIntervalMs: 4 * 3600 * 1000,
+  /** 上次同步时间记在哪（相对路径则落在当前工作目录） */
+  syncStateFile: 'mihealthlink-sync.json',
 }
 
 /* ----------------------------------------------------------------- 基础设施 -- */
@@ -149,6 +197,47 @@ function isoDate(d) {
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
 }
 
+/* ------------------------------------------------------- 同步节流（状态文件） -- */
+
+function readSyncState(cfg) {
+  try {
+    const data = JSON.parse(readFileSync(cfg.syncStateFile, 'utf8'))
+    return { lastAt: Number(data?.lastAt) || 0, lastKind: String(data?.lastKind ?? '') }
+  } catch {
+    return { lastAt: 0, lastKind: '' }
+  }
+}
+
+function writeSyncState(cfg, kind) {
+  try {
+    mkdirSync(dirname(cfg.syncStateFile), { recursive: true })
+    writeFileSync(
+      cfg.syncStateFile,
+      JSON.stringify({ lastAt: Date.now(), lastKind: kind, at: new Date().toISOString() }, null, 2),
+      'utf8',
+    )
+  } catch {
+    /* 状态写不了不影响同步本身 */
+  }
+}
+
+/** 距上次同步还有多久（毫秒）；0 = 现在就可以。 */
+function syncCooldownLeft(cfg) {
+  const min = Number(cfg.minSyncIntervalMs)
+  if (!(min > 0)) return 0
+  const { lastAt } = readSyncState(cfg)
+  if (!lastAt) return 0
+  return Math.max(0, lastAt + min - Date.now())
+}
+
+function humanWait(ms) {
+  const minutes = Math.ceil(ms / 60000)
+  if (minutes < 60) return minutes + ' 分钟'
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return hours + ' 小时' + (rest ? ' ' + rest + ' 分钟' : '')
+}
+
 function rangeForDays(days) {
   const end = new Date()
   const start = new Date(end.getTime() - (Math.max(1, days) - 1) * 86400000)
@@ -202,6 +291,18 @@ export function syncTool(cfg) {
       render: (_a, v) => [{ type: 'text', text: v.message }],
     },
     async execute(args = {}) {
+      // 节流：这道闸只挡「工具触发的同步」，自动同步走 makeAutoSync 的 tick，不经过这里。
+      const left = syncCooldownLeft(cfg)
+      if (left > 0) {
+        const last = readSyncState(cfg)
+        return {
+          ok: false,
+          message:
+            '刚同步过（' + new Date(last.lastAt).toLocaleString('zh-CN') + '），'
+            + '为了不撞小米云端限流，' + humanWait(left) + '后才可以再同步。\n'
+            + '库里的数据是新的，直接看就行：mi_health_brief / mi_health_report。',
+        }
+      }
       const days = Number(args.days) > 0 ? Math.floor(Number(args.days)) : 7
       const { start, end } = rangeForDays(days)
       log(cfg, '同步 ' + start + ' → ' + end)
@@ -211,6 +312,7 @@ export function syncTool(cfg) {
         { timeoutMs: cfg.syncTimeoutMs, env: { MI_FITNESS_DB_PATH: cfg.dbPath } },
       )
       log(cfg, '同步结束 code=' + r.code)
+      if (r.code === 0) writeSyncState(cfg, 'tool')
       return shape(r)
     },
   }
@@ -278,6 +380,134 @@ export function briefTool(cfg) {
 
 /* ------------------------------------------------------------------- 巡检 -- */
 
+/** 跑一次健康检查，拿脚本给出的「决定」（不发送） */
+async function decideNudge(cfg, { force = false } = {}) {
+  const argv = [
+    cfg.pythonPath, cfg.nudgeScript,
+    '--db', cfg.dbPath,
+    '--state', cfg.nudgeState,
+    '--key', cfg.nudgeKey,
+    '--sleep-min-hours', String(cfg.sleepMinHours),
+    '--steps-min', String(cfg.stepsMinPerDay),
+    '--max-per-day', String(cfg.nudgeMaxPerDay),
+    '--dedupe-days', String(cfg.nudgeDedupeDays),
+    '--quiet-start', String(cfg.nudgeQuietStart),
+    '--quiet-end', String(cfg.nudgeQuietEnd),
+    '--emit',
+  ]
+  if (force) argv.push('--force')
+  const r = await runCommand(cfg, argv, { timeoutMs: 90000 })
+  const text = (r.stdout || '').trim()
+  const line = text.split('\n').find((l) => l.trim().startsWith('{'))
+  if (!line) return { action: 'error', reason: text || (r.stderr || '').trim() || `退出码 ${r.code}` }
+  try {
+    return JSON.parse(line)
+  } catch (error) {
+    return { action: 'error', reason: '解析脚本输出失败：' + (error?.message ?? error) }
+  }
+}
+
+/** 记账：告诉脚本「这条已经发出去了」 */
+async function recordNudge(cfg, topic) {
+  await runCommand(
+    cfg,
+    [cfg.pythonPath, cfg.nudgeScript, '--db', cfg.dbPath, '--state', cfg.nudgeState, '--record-topic', topic],
+    { timeoutMs: 60000 },
+  )
+}
+
+/**
+ * 投递。
+ * ⚠️ 这一步必须在 Node 侧（Windows）做：桥接只听 127.0.0.1:3100，
+ * 而 WSL 里的 127.0.0.1 是 WSL 自己，连不上（实测 Connection refused）。
+ */
+async function postNudge(cfg, message) {
+  const res = await fetch(cfg.nudgeUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-console-token': cfg.nudgeToken },
+    body: JSON.stringify({ key: cfg.nudgeKey, message }),
+  })
+  const body = await res.text()
+  let parsed = null
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    /* 非 JSON 就当失败 */
+  }
+  if (!res.ok || !parsed?.ok) throw new Error(`HTTP ${res.status} ${body.slice(0, 200)}`)
+  return parsed
+}
+
+/** 完整动作：判断 → 发送 → 记账 */
+async function runNudge(cfg, { dryRun = false, force = false } = {}) {
+  if (!dryRun && !force && !cfg.nudgeEnabled) {
+    return { ok: false, message: '主动关心是关着的（nudgeEnabled=false）' }
+  }
+  const d = await decideNudge(cfg, { force })
+  if (d.action === 'none') return { ok: true, message: '数据不够，没有值得提醒的事。' }
+  if (d.action === 'error') return { ok: false, message: '判断脚本出错：' + d.reason }
+  if (d.action === 'skip') return { ok: true, message: `这次不发（${d.reason}）。\n\n本来会说：\n${d.message}` }
+  if (dryRun) return { ok: true, message: `[预演] 会发给 ${d.key}：\n\n${d.message}` }
+
+  if (!cfg.nudgeToken) {
+    return { ok: false, message: '缺少 nudgeToken（在 config.local.json 里填 SurfCore 的 consoleToken）' }
+  }
+  try {
+    await postNudge(cfg, d.message)
+  } catch (error) {
+    return { ok: false, message: '投递失败：' + (error?.message ?? error) }
+  }
+  await recordNudge(cfg, d.topic)
+  return { ok: true, message: `已发送（${d.topic}）：\n\n${d.message}` }
+}
+
+export function nudgeTool(cfg) {
+  return {
+    name: 'mi_health_nudge',
+    description:
+      '健康和主动关心：按阈值检查睡眠/步数/心率，够格就通过 SurfCore 投一句话到她的 QQ 私聊。'
+      + '默认只预演（dryRun=true，不打扰人）；force=true 才忽略时段和去重直接发。'
+      + '内置闸门：每天最多 N 条、只在工作时段发、同一话题几天内不重复。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        dryRun: { type: 'boolean', description: 'true（默认）= 只显示会发什么，不真的发' },
+        force: { type: 'boolean', description: 'true = 忽略时段/去重/开关（测试用，会真的发出去）' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { ok: { type: 'boolean' }, message: { type: 'string' } },
+        required: ['ok', 'message'],
+      },
+      render: (_a, v) => [{ type: 'text', text: v.message }],
+    },
+    async execute(args = {}) {
+      const dryRun = args.dryRun === undefined ? true : Boolean(args.dryRun)
+      return runNudge(cfg, { dryRun, force: Boolean(args.force) })
+    },
+  }
+}
+
+function makeNudgeLoop(cfg) {
+  let busy = false
+  return async function tick() {
+    if (busy || !cfg.nudgeEnabled || !cfg.nudgeToken) return
+    busy = true
+    try {
+      const r = await runNudge(cfg)
+      log(cfg, '主动关心：' + (r.message || '').slice(0, 200).replace(/\n+/g, ' '))
+    } catch (error) {
+      log(cfg, '主动关心异常：' + (error?.message ?? error))
+    } finally {
+      busy = false
+    }
+  }
+}
+
 function makeAutoSync(cfg) {
   let busy = false
   return async function tick() {
@@ -293,6 +523,7 @@ function makeAutoSync(cfg) {
         { timeoutMs: cfg.syncTimeoutMs, env: { MI_FITNESS_DB_PATH: cfg.dbPath } },
       )
       const summary = (r.stdout || '').split('\n').filter((l) => l.includes('✅')).join(' / ')
+      if (r.code === 0) writeSyncState(cfg, 'auto')
       log(cfg, '自动同步 ' + start + '→' + end + ' code=' + r.code + ' ' + summary)
     } catch (error) {
       log(cfg, '自动同步异常：' + (error?.message ?? error))
@@ -308,7 +539,8 @@ function makeAutoSync(cfg) {
 function loadLocalConfig() {
   try {
     const url = new URL('./config.local.json', import.meta.url)
-    return JSON.parse(readFileSync(url, 'utf8'))
+    // 去掉 BOM：Windows 记事本/PowerShell 存 UTF-8 时经常带 BOM，JSON.parse 会直接抛。
+    return JSON.parse(readFileSync(url, 'utf8').replace(/^\\uFEFF/, ''))
   } catch {
     return {}
   }
@@ -326,15 +558,48 @@ export function apply(ctx, rawConfig = {}) {
   ctx.effect(() => ctx.tools.register(syncTool(cfg)), 'dsh-mihealthlink: sync')
   ctx.effect(() => ctx.tools.register(reportTool(cfg)), 'dsh-mihealthlink: report')
   ctx.effect(() => ctx.tools.register(briefTool(cfg)), 'dsh-mihealthlink: brief')
+  ctx.effect(() => ctx.tools.register(nudgeTool(cfg)), 'dsh-mihealthlink: nudge')
+
+  // 主动关心：每 nudgeIntervalMinutes 检查一次（脚本内部还有时段/条数/去重三道闸）
+  const nudge = makeNudgeLoop(cfg)
+  const nudgeMinutes = Number(cfg.nudgeIntervalMinutes)
+  if (cfg.nudgeEnabled && nudgeMinutes > 0) {
+    ctx.effect(() => {
+      const timer = setInterval(() => {
+        void nudge()
+      }, nudgeMinutes * 60 * 1000)
+      if (typeof timer.unref === 'function') timer.unref()
+      return () => clearInterval(timer)
+    }, 'dsh-mihealthlink: nudge loop')
+    log(cfg, `主动关心已开启（每 ${nudgeMinutes} 分钟检查一次，投给 ${cfg.nudgeKey}）`)
+  }
 
   const tick = makeAutoSync(cfg)
   if (cfg.autoSyncHours > 0) {
     ctx.effect(() => {
-      const timer = setInterval(() => {
-        void tick()
-      }, cfg.autoSyncHours * 3600 * 1000)
-      if (typeof timer.unref === 'function') timer.unref()
-      return () => clearInterval(timer)
+      let timer = null
+      let first = null
+      const everyMs = cfg.autoSyncHours * 3600 * 1000
+      const startInterval = () => {
+        timer = setInterval(() => {
+          void tick()
+        }, everyMs)
+        if (typeof timer.unref === 'function') timer.unref()
+      }
+      if (cfg.autoSyncOnStart) {
+        const delay = Number(cfg.autoSyncInitialDelayMs)
+        first = setTimeout(() => {
+          log(cfg, '启动补同步（距上次手动同步可能已经很久）')
+          void tick().finally(startInterval)
+        }, Number.isFinite(delay) && delay >= 0 ? delay : DEFAULTS.autoSyncInitialDelayMs)
+        if (typeof first.unref === 'function') first.unref()
+      } else {
+        startInterval()
+      }
+      return () => {
+        if (first) clearTimeout(first)
+        if (timer) clearInterval(timer)
+      }
     }, 'dsh-mihealthlink: auto sync')
   }
 }
